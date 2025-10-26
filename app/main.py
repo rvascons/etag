@@ -9,13 +9,14 @@ and without ETag optimization.
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, EmailStr
 import uvicorn
 import time
 import asyncio
 from typing import Optional
 
-# Import our modules (to be implemented)
-# from models import User, UserDatabase
+# Import our modules
+from models import User, UserDatabase
 # from etag_service import ETagService
 # from cache_service import CacheService
 # from metrics import MetricsCollector
@@ -29,11 +30,22 @@ app = FastAPI(
 # Serve static files (test interface)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# TODO: Initialize services
-# db = UserDatabase()
+# Initialize services
+db = UserDatabase()
 # etag_service = ETagService()
 # cache_service = CacheService()
 # metrics = MetricsCollector()
+
+
+# Pydantic models for request validation
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
 
 @app.get("/")
 async def root():
@@ -81,7 +93,7 @@ async def root():
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
                         name: 'Test User ' + Date.now(),
-                        email: 'test@example.com'
+                        email: 'test' + Math.floor(Math.random() * 100) + '@example.com'
                     })
                 });
                 const result = await response.json();
@@ -159,58 +171,93 @@ async def get_user(user_id: int, request: Request):
     2. Conditional request handling (If-None-Match)
     3. Performance difference between cached and uncached responses
     """
+    # Add artificial delay to simulate complex database query (50ms)
+    await asyncio.sleep(0.01)
+    
+    # Get user from database
+    user = db.get_user(user_id)
+    
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
     # TODO: Implement ETag logic
     # - Check If-None-Match header
     # - Validate ETag from cache
     # - Return 304 if not modified
     # - Return 200 with new ETag if modified
     
-    # Placeholder implementation
-    await asyncio.sleep(0.05)  # Simulate database query delay
+    return user.to_dict()
+
+@app.get("/users")
+async def get_all_users(limit: int = 100, offset: int = 0):
+    """Get all users with pagination."""
+    # Add artificial delay (30ms)
+    await asyncio.sleep(0.03)
+    
+    users = db.get_all_users(limit=limit, offset=offset)
+    total = db.count_users()
+    
     return {
-        "id": user_id,
-        "name": f"User {user_id}",
-        "email": f"user{user_id}@example.com",
-        "updated_at": "2025-10-13T10:00:00Z"
+        "users": [user.to_dict() for user in users],
+        "total": total,
+        "limit": limit,
+        "offset": offset
     }
 
 @app.post("/users")
-async def create_user(user_data: dict):
+async def create_user(user_data: UserCreate):
     """Create a new user."""
-    # TODO: Implement user creation
-    # - Save to database
-    # - Generate initial ETag
-    # - Store ETag in cache
+    # Add artificial delay to simulate database write (20ms)
+    await asyncio.sleep(0.05)
     
-    # Placeholder implementation
-    await asyncio.sleep(0.02)  # Simulate database write
-    return {
-        "id": 1,
-        "name": user_data.get("name"),
-        "email": user_data.get("email"),
-        "created_at": "2025-10-13T10:00:00Z"
-    }
+    try:
+        user = db.create_user(user_data.name, user_data.email)
+    except Exception as e:
+        # Handle duplicate email or other database errors
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # TODO: Generate initial ETag and store in cache
+    
+    return user.to_dict()
 
 @app.put("/users/{user_id}")
-async def update_user(user_id: int, user_data: dict):
+async def update_user(user_id: int, user_data: UserUpdate):
     """
     Update user and invalidate ETag cache.
     
     This demonstrates cache invalidation when data changes.
     """
-    # TODO: Implement user update
-    # - Update database
-    # - Generate new ETag
-    # - Update cache
+    # Add artificial delay to simulate database update (30ms)
+    await asyncio.sleep(0.05)
     
-    # Placeholder implementation
-    await asyncio.sleep(0.03)  # Simulate database update
-    return {
-        "id": user_id,
-        "name": user_data.get("name"),
-        "email": user_data.get("email"),
-        "updated_at": "2025-10-13T10:00:00Z"
-    }
+    # Update user in database
+    user = db.update_user(
+        user_id, 
+        name=user_data.name, 
+        email=user_data.email
+    )
+    
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # TODO: Invalidate ETag cache and generate new ETag
+    
+    return user.to_dict()
+
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: int):
+    """Delete a user."""
+    # Add artificial delay (20ms)
+    await asyncio.sleep(0.02)
+    
+    deleted = db.delete_user(user_id)
+    
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # TODO: Clean up ETag cache
+    
+    return {"message": "User deleted successfully", "id": user_id}
 
 @app.get("/metrics")
 async def get_metrics():
@@ -219,23 +266,34 @@ async def get_metrics():
     
     Returns cache hit rates, response times, and database query statistics.
     """
-    # TODO: Implement metrics collection
+    # TODO: Implement full metrics collection
     # - Cache hit/miss rates
     # - Average response times
     # - Database queries saved
     # - Bandwidth savings
     
-    # Placeholder metrics
+    # Basic metrics for now
+    total_users = db.count_users()
+    
     return {
-        "total_requests": 0,
-        "cache_hits": 0,
-        "cache_misses": 0,
-        "cache_hit_rate": "0%",
-        "avg_response_time_cached": "0ms",
-        "avg_response_time_uncached": "0ms",
-        "database_queries_saved": 0,
-        "bandwidth_saved_bytes": 0,
-        "uptime_seconds": 0
+        "database": {
+            "total_users": total_users,
+            "database_file": db.db_path
+        },
+        "cache": {
+            "status": "Not implemented yet",
+            "hit_rate": "0%"
+        },
+        "performance": {
+            "total_requests": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "cache_hit_rate": "0%",
+            "avg_response_time_cached": "0ms",
+            "avg_response_time_uncached": "0ms",
+            "database_queries_saved": 0,
+            "bandwidth_saved_bytes": 0
+        }
     }
 
 if __name__ == "__main__":
