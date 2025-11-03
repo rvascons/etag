@@ -10,8 +10,13 @@ This module handles:
 import time
 import hashlib
 import json
+import asyncio
+import logging
 from typing import Optional, Dict, Any
 from dataclasses import dataclass
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ETagResult:
@@ -19,6 +24,7 @@ class ETagResult:
     is_valid: bool
     current_etag: str
     cache_hit: bool = False
+    entity: Optional[Any] = None  # The fetched entity (if retrieved from DB)
 
 class ETagService:
     """
@@ -30,8 +36,16 @@ class ETagService:
     - Version-based (database version numbers)
     """
     
-    def __init__(self, cache_service=None):
+    def __init__(self, cache_service=None, db_service=None):
+        """
+        Initialize ETag service.
+        
+        Args:
+            cache_service: CacheService instance for ETag caching
+            db_service: Database service for fetching entity timestamps
+        """
         self.cache_service = cache_service
+        self.db_service = db_service
         self.strategy = "timestamp"  # Default strategy
     
     def generate_etag(self, entity_type: str, entity_id: int, 
@@ -54,9 +68,9 @@ class ETagService:
         if self.strategy == "timestamp":
             return self._generate_timestamp_etag(entity_type, entity_id, timestamp)
         elif self.strategy == "hash":
-            return self._generate_hash_etag(content)
+            raise NotImplementedError()
         elif self.strategy == "version":
-            return self._generate_version_etag(entity_type, entity_id, version)
+            raise NotImplementedError()
         else:
             raise ValueError(f"Unknown ETag strategy: {self.strategy}")
     
@@ -70,29 +84,6 @@ class ETagService:
         etag_value = f"{entity_type}-{entity_id}-{int(timestamp)}"
         return f'"{etag_value}"'
     
-    def _generate_hash_etag(self, content: Dict[Any, Any]) -> str:
-        """Generate ETag from content hash (most accurate)."""
-        if content is None:
-            content = {}
-        
-        # Serialize content consistently
-        content_str = json.dumps(content, sort_keys=True, separators=(',', ':'))
-        
-        # Generate MD5 hash
-        hash_obj = hashlib.md5(content_str.encode('utf-8'))
-        etag_value = hash_obj.hexdigest()
-        
-        return f'"{etag_value}"'
-    
-    def _generate_version_etag(self, entity_type: str, entity_id: int, 
-                              version: Optional[int] = None) -> str:
-        """Generate ETag from version number."""
-        if version is None:
-            version = 1
-        
-        etag_value = f"{entity_type}-{entity_id}-v{version}"
-        return f'"{etag_value}"'
-    
     async def validate_etag(self, entity_type: str, entity_id: int, 
                            client_etag: Optional[str]) -> ETagResult:
         """
@@ -104,15 +95,24 @@ class ETagService:
             client_etag: ETag from client's If-None-Match header
             
         Returns:
-            ETagResult with validation status and current ETag
+            ETagResult with validation status, current ETag, and entity (if fetched)
+            
+        Raises:
+            ValueError: If entity does not exist
         """
+        # Get current ETag from cache or generate new one
+        # This will raise ValueError if entity doesn't exist
+        # Also returns the entity if it was fetched from DB (cache miss)
+        current_etag, cache_hit, entity = await self._get_current_etag(entity_type, entity_id)
+        logger.debug(f"Received Etag: {client_etag}")
         if not client_etag:
             # No client ETag means we need to return full response
-            current_etag = await self._get_current_etag(entity_type, entity_id)
-            return ETagResult(is_valid=False, current_etag=current_etag)
-        
-        # Get current ETag from cache or generate new one
-        current_etag = await self._get_current_etag(entity_type, entity_id)
+            return ETagResult(
+                is_valid=False, 
+                current_etag=current_etag, 
+                cache_hit=cache_hit,
+                entity=entity
+            )
         
         # Compare ETags
         is_valid = client_etag == current_etag
@@ -120,27 +120,63 @@ class ETagService:
         return ETagResult(
             is_valid=is_valid,
             current_etag=current_etag,
-            cache_hit=self.cache_service is not None
+            cache_hit=cache_hit,
+            entity=entity  # Include entity (will be None if cache hit)
         )
     
-    async def _get_current_etag(self, entity_type: str, entity_id: int) -> str:
-        """Get current ETag for entity from cache or generate new one."""
+    async def _get_current_etag(self, entity_type: str, entity_id: int) -> tuple[str, bool, Optional[Any]]:
+        """
+        Get current ETag for entity from cache or generate new one.
+        
+        Returns:
+            Tuple of (etag, cache_hit_bool, entity_object)
+            - If cache hit: entity_object is None (not fetched from DB)
+            - If cache miss: entity_object is the fetched entity
+            
+        Raises:
+            ValueError: If entity does not exist in database
+        """
+        cache_hit = False
+        entity = None
+        
         if self.cache_service:
             # Try to get from cache first
             cached_etag = await self.cache_service.get_etag(entity_type, entity_id)
             if cached_etag:
-                return cached_etag
+                logger.debug(f"🎯 ETag cache HIT: {entity_type}:{entity_id}")
+                return cached_etag, True, None  # No entity fetched on cache hit
         
-        # Generate new ETag if not in cache
-        # In real implementation, this would get timestamp/version from database
-        current_timestamp = time.time()
-        etag = self.generate_etag(entity_type, entity_id, timestamp=current_timestamp)
+        # Cache miss - generate new ETag from database
+        logger.debug(f"📊 ETag cache MISS: {entity_type}:{entity_id} - generating from DB")
+        
+        if entity_type == "user" and self.db_service:
+            # Add artificial delay to simulate database read
+            await asyncio.sleep(0.5)
+            
+            # Get user from database to get updated_at timestamp
+            user = self.db_service.get_user(entity_id)
+            
+            # IMPORTANT: Don't generate ETag for non-existent entities!
+            if not user:
+                raise ValueError(f"User {entity_id} does not exist - cannot generate ETag")
+            
+            # Store the entity to return it
+            entity = user
+            
+            # Generate ETag from user's updated_at timestamp
+            if user.updated_at:
+                etag = self.generate_etag(entity_type, entity_id, timestamp=user.updated_at)
+            else:
+                # Fallback to created_at or current time
+                raise ValueError(f"User {user.id} malformed") 
+        else:
+            raise NotImplementedError(f"Not Implemented for entity type: {entity_type}")
         
         # Store in cache for next time
         if self.cache_service:
             await self.cache_service.set_etag(entity_type, entity_id, etag)
         
-        return etag
+        return etag, False, entity  # Return entity on cache miss
     
     async def invalidate_etag(self, entity_type: str, entity_id: int) -> None:
         """
@@ -173,100 +209,3 @@ class ETagService:
             await self.cache_service.set_etag(entity_type, entity_id, new_etag)
         
         return new_etag
-    
-    def set_strategy(self, strategy: str) -> None:
-        """
-        Set ETag generation strategy.
-        
-        Args:
-            strategy: 'timestamp', 'hash', or 'version'
-        """
-        valid_strategies = ['timestamp', 'hash', 'version']
-        if strategy not in valid_strategies:
-            raise ValueError(f"Strategy must be one of: {valid_strategies}")
-        
-        self.strategy = strategy
-    
-    def get_weak_etag(self, strong_etag: str) -> str:
-        """Convert strong ETag to weak ETag."""
-        if strong_etag.startswith('W/"'):
-            return strong_etag  # Already weak
-        
-        # Remove quotes and add W/ prefix
-        etag_value = strong_etag.strip('"')
-        return f'W/"{etag_value}"'
-
-
-# TODO: Implementation examples and usage patterns
-
-class ETagValidator:
-    """
-    Helper class for ETag validation in HTTP requests.
-    
-    Handles parsing of If-None-Match headers and ETag comparison.
-    """
-    
-    @staticmethod
-    def parse_if_none_match(header_value: Optional[str]) -> list[str]:
-        """
-        Parse If-None-Match header value.
-        
-        Args:
-            header_value: Value of If-None-Match header
-            
-        Returns:
-            List of ETag values
-        """
-        if not header_value:
-            return []
-        
-        # Handle wildcard
-        if header_value.strip() == "*":
-            return ["*"]
-        
-        # Parse comma-separated ETags
-        etags = []
-        for etag in header_value.split(','):
-            etag = etag.strip()
-            if etag:
-                etags.append(etag)
-        
-        return etags
-    
-    @staticmethod
-    def etags_match(etag1: str, etag2: str) -> bool:
-        """
-        Compare two ETags for equality.
-        
-        Handles both strong and weak ETag comparisons.
-        """
-        # Normalize ETags (remove W/ prefix for comparison)
-        normalized_etag1 = etag1.replace('W/', '').strip('"')
-        normalized_etag2 = etag2.replace('W/', '').strip('"')
-        
-        return normalized_etag1 == normalized_etag2
-
-
-# Example usage and testing functions
-async def example_usage():
-    """Example demonstrating ETag service usage."""
-    
-    # Initialize service (in real app, inject cache_service)
-    etag_service = ETagService()
-    
-    # Generate ETag for a user
-    user_etag = etag_service.generate_etag("user", 123, timestamp=time.time())
-    print(f"Generated ETag: {user_etag}")
-    
-    # Validate ETag
-    result = await etag_service.validate_etag("user", 123, user_etag)
-    print(f"ETag valid: {result.is_valid}")
-    
-    # Update ETag after entity change
-    new_etag = await etag_service.update_etag("user", 123, timestamp=time.time())
-    print(f"New ETag: {new_etag}")
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(example_usage())

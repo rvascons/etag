@@ -13,13 +13,17 @@ from pydantic import BaseModel, EmailStr
 import uvicorn
 import time
 import asyncio
+import logging
 from typing import Optional
 
 # Import our modules
 from models import User, UserDatabase
-# from etag_service import ETagService
-# from cache_service import CacheService
-# from metrics import MetricsCollector
+from etag_service import ETagService
+from cache_service import CacheService, initialize_cache, cleanup_cache
+from metrics import MetricsCollector, initialize_metrics
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="ETag Implementation Demo",
@@ -27,14 +31,42 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Serve static files (test interface)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Serve static files (test interface) - use parent directory
+import os
+static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 # Initialize services
 db = UserDatabase()
-# etag_service = ETagService()
-# cache_service = CacheService()
-# metrics = MetricsCollector()
+cache_service: Optional[CacheService] = None
+etag_service: Optional[ETagService] = None
+metrics: Optional[MetricsCollector] = None
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on application startup."""
+    global cache_service, etag_service, metrics
+    
+    print("🚀 Initializing ETag Demo services...")
+    
+    # Initialize cache service
+    cache_service = await initialize_cache()
+    
+    # Initialize ETag service with cache and database
+    etag_service = ETagService(cache_service=cache_service, db_service=db)
+    
+    # Initialize metrics collection
+    metrics = initialize_metrics()
+    
+    print("✅ All services initialized successfully!")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup services on application shutdown."""
+    print("📕 Shutting down services...")
+    await cleanup_cache()
+    print("✅ Cleanup completed!")
 
 
 # Pydantic models for request validation
@@ -54,146 +86,309 @@ async def root():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>ETag Demo</title>
+        <title>ETag Demo - Simple Interface</title>
         <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            button { margin: 10px; padding: 10px 20px; }
-            .result { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
-            .metrics { background: #e8f4f8; padding: 15px; border-radius: 5px; }
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 1200px;
+                margin: 20px auto;
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            h1 {
+                color: #333;
+            }
+            .controls {
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            button {
+                background: #007bff;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 4px;
+                cursor: pointer;
+                margin: 5px;
+                font-size: 14px;
+            }
+            button:hover {
+                background: #0056b3;
+            }
+            input {
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                margin: 5px;
+                width: 100px;
+            }
+            #metrics {
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                margin-bottom: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            #results {
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            .result {
+                padding: 10px;
+                margin: 10px 0;
+                border-radius: 4px;
+                background: #e7f3ff;
+                border-left: 4px solid #007bff;
+            }
+            pre {
+                background: #f8f9fa;
+                padding: 10px;
+                border-radius: 4px;
+                overflow-x: auto;
+            }
         </style>
     </head>
     <body>
-        <div class="container">
-            <h1>ETag Implementation Demo</h1>
-            <p>This demo shows the performance difference between API requests with and without ETag caching.</p>
-            
-            <h2>Test Controls</h2>
-            <button onclick="createUser()">Create Test User</button>
-            <button onclick="getUser()">Get User (Watch for ETags!)</button>
-            <button onclick="updateUser()">Update User (Invalidates Cache)</button>
-            <button onclick="loadTest()">Run Load Test</button>
-            <button onclick="getMetrics()">Show Metrics</button>
-            
-            <h2>Results</h2>
-            <div id="results"></div>
-            
-            <h2>Performance Metrics</h2>
-            <div id="metrics" class="metrics">
-                <p>Metrics will appear here...</p>
+        <h1>🏷️ ETag Demo - Simple Test Interface</h1>
+        
+        <div class="controls">
+            <h3>Test Controls</h3>
+            <div>
+                <label>User ID:</label>
+                <input type="number" id="userId" value="5" placeholder="User ID">
+                <br><br>
+                <label>ETag (optional):</label>
+                <input type="text" id="etag" placeholder="Leave empty for no If-None-Match" style="width: 300px;">
+                <br><br>
+                <button onclick="getUser()">Get User</button>
+                <button onclick="loadTest()">Load Test (50 requests)</button>
             </div>
         </div>
-        
+
+        <div id="metrics">
+            <h3>📊 Metrics</h3>
+            <div id="metricsContent">Loading...</div>
+        </div>
+
+        <div id="results">
+            <h3>📋 Results</h3>
+        </div>
+
         <script>
-            let userId = 1;
-            
-            async function createUser() {
-                const response = await fetch('/users', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        name: 'Test User ' + Date.now(),
-                        email: 'test' + Math.floor(Math.random() * 100) + '@example.com'
-                    })
-                });
-                const result = await response.json();
-                userId = result.id;
-                showResult('User created: ' + JSON.stringify(result));
-            }
-            
             async function getUser() {
+                const id = parseInt(document.getElementById('userId').value);
+                const etag = document.getElementById('etag').value.trim();
+                
+                showResult(`Fetching user ${id}${etag ? ' with ETag: ' + etag : ' (no ETag)'}...`);
+                
+                const headers = {};
+                if (etag) {
+                    headers['If-None-Match'] = etag;
+                }
+                
                 const start = performance.now();
-                const response = await fetch(`/users/${userId}`);
+                const response = await fetch(`/users/${id}`, { headers });
                 const end = performance.now();
                 
-                const etag = response.headers.get('ETag');
-                const status = response.status;
-                const data = status === 304 ? 'Not Modified (Cached)' : await response.json();
+                if (response.status === 304) {
+                    const receivedETag = response.headers.get('ETag');
+                    showResult(`✅ GET /users/${id} with If-None-Match
+Status: 304 Not Modified 🎉
+ETag: ${receivedETag}
+Time: ${(end-start).toFixed(2)}ms
+💾 Cache HIT - No data transferred! Database query skipped!`);
+                } else if (response.ok) {
+                    const receivedETag = response.headers.get('ETag');
+                    const data = await response.json();
+                    
+                    // Auto-fill the ETag field for next request
+                    document.getElementById('etag').value = receivedETag;
+                    
+                    showResult(`✅ GET /users/${id}
+Status: ${response.status} OK
+ETag: ${receivedETag}
+Time: ${(end-start).toFixed(2)}ms
+Response: ${JSON.stringify(data, null, 2)}
+
+💡 ETag saved! Click "Get User" again to test 304 response.`);
+                } else if (response.status === 404) {
+                    showResult(`❌ User ${id} not found`);
+                } else {
+                    showResult(`❌ Error: ${response.status}`);
+                }
                 
-                showResult(`GET /users/${userId} - Status: ${status} - ETag: ${etag} - Time: ${(end-start).toFixed(2)}ms - Data: ${JSON.stringify(data)}`);
+                // Refresh metrics
+                await getMetrics();
             }
-            
-            async function updateUser() {
-                const response = await fetch(`/users/${userId}`, {
-                    method: 'PUT',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        name: 'Updated User ' + Date.now(),
-                        email: 'updated@example.com'
-                    })
-                });
-                const result = await response.json();
-                showResult('User updated: ' + JSON.stringify(result));
-            }
-            
+
             async function loadTest() {
-                showResult('Running load test with 50 requests...');
+                const id = parseInt(document.getElementById('userId').value);
+                showResult(`🚀 Starting load test: 50 requests to /users/${id}...`);
+                
+                const requestTimes = [];
                 const promises = [];
+                
                 for (let i = 0; i < 50; i++) {
-                    promises.push(fetch(`/users/${userId}`));
+                    const requestStart = performance.now();
+                    const promise = fetch(`/users/${id}`).then(response => {
+                        const requestEnd = performance.now();
+                        const duration = requestEnd - requestStart;
+                        requestTimes.push(duration);
+                        return response;
+                    });
+                    promises.push(promise);
                 }
                 
                 const start = performance.now();
                 await Promise.all(promises);
                 const end = performance.now();
                 
-                showResult(`Load test completed: 50 requests in ${(end-start).toFixed(2)}ms (${((end-start)/50).toFixed(2)}ms avg per request)`);
+                const totalTime = end - start;
+                const avgTime = totalTime / 50;
+                
+                // Create a summary of all request times
+                const timesBreakdown = requestTimes.map((time, index) => 
+                    `Request ${index + 1}: ${time.toFixed(2)}ms`
+                ).join('\\n');
+                
+                showResult(`✅ Load test completed!
+Total time: ${totalTime.toFixed(2)}ms
+Average per request: ${avgTime.toFixed(2)}ms
+
+Individual request times:
+${timesBreakdown}`);
+                
+                // Refresh metrics
+                await getMetrics();
             }
-            
+
             async function getMetrics() {
                 const response = await fetch('/metrics');
                 const metrics = await response.json();
-                document.getElementById('metrics').innerHTML = '<pre>' + JSON.stringify(metrics, null, 2) + '</pre>';
+                document.getElementById('metricsContent').innerHTML = '<pre>' + JSON.stringify(metrics, null, 2) + '</pre>';
             }
-            
+
             function showResult(text) {
                 const div = document.createElement('div');
                 div.className = 'result';
-                div.textContent = new Date().toLocaleTimeString() + ': ' + text;
-                document.getElementById('results').appendChild(div);
-                div.scrollIntoView();
+                div.textContent = new Date().toLocaleTimeString() + ':\\n' + text;
+                div.style.whiteSpace = 'pre-wrap';
+                document.getElementById('results').insertBefore(div, document.getElementById('results').firstChild);
             }
-            
-            // Auto-refresh metrics every 5 seconds
-            setInterval(getMetrics, 5000);
+
+            // Auto-load metrics on start
+            setTimeout(getMetrics, 1000);
         </script>
     </body>
     </html>
     """)
 
 @app.get("/users/{user_id}")
-async def get_user(user_id: int, request: Request):
+async def get_user(user_id: int, request: Request, response: Response):
     """
-    Get user with ETag support.
+    Get user with ETag support - OPTIMIZED VERSION.
     
     This endpoint demonstrates:
-    1. ETag generation
-    2. Conditional request handling (If-None-Match)
-    3. Performance difference between cached and uncached responses
+    1. Early ETag validation (before DB access)
+    2. Database query only when necessary
+    3. Cache hit/miss tracking
+    4. Performance metrics collection
+    
+    Flow:
+    - If client sends If-None-Match → validate from cache first
+    - If ETag matches → return 304 (NO DATABASE HIT!)
+    - If ETag doesn't match or missing → fetch from DB
     """
-    # Add artificial delay to simulate complex database query (50ms)
-    await asyncio.sleep(0.01)
+    start_time = time.time()
     
-    # Get user from database
-    user = db.get_user(user_id)
     
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+    if etag_service:
+        client_etag = request.headers.get("If-None-Match")
+        
+        try:
+            etag_result = await etag_service.validate_etag("user", user_id, client_etag)
+            
+            response.headers["ETag"] = etag_result.current_etag
+            response.headers["Cache-Control"] = "private, must-revalidate"
+            
+            if etag_result.is_valid:
+                response_time_ms = (time.time() - start_time) * 1000
+                
+                if metrics:
+                    metrics.record_request(
+                        endpoint=f"/users/{user_id}",
+                        response_time_ms=response_time_ms,
+                        cache_hit=etag_result.cache_hit,
+                        status_code=304,
+                        response_size_bytes=0
+                    )
+                
+                response.status_code = 304
+                return Response(status_code=304)
+        
+        except ValueError:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        if etag_result.entity:
+            user = etag_result.entity
+            logger.debug(f"♻️  Reusing entity from ETag validation - NO second DB query!")
+        else:
+            logger.debug(f"🔍 ETag cache hit but need full data - querying DB")
+            
+            await asyncio.sleep(0.5)
+            
+            user = db.get_user(user_id)
+            
+            if user is None:
+                raise HTTPException(status_code=404, detail="User not found")
+        
+        response_time_ms = (time.time() - start_time) * 1000
+        user_dict = user.to_dict()
+        
+        if metrics:
+            response_size = len(str(user_dict).encode('utf-8'))
+            metrics.record_request(
+                endpoint=f"/users/{user_id}",
+                response_time_ms=response_time_ms,
+                cache_hit=etag_result.cache_hit,
+                status_code=200,
+                response_size_bytes=response_size
+            )
+        
+        return user_dict
     
-    # TODO: Implement ETag logic
-    # - Check If-None-Match header
-    # - Validate ETag from cache
-    # - Return 304 if not modified
-    # - Return 200 with new ETag if modified
-    
-    return user.to_dict()
+    else:
+        await asyncio.sleep(0.5)
+        
+        user = db.get_user(user_id)
+        
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        response_time_ms = (time.time() - start_time) * 1000
+        user_dict = user.to_dict()
+        
+        if metrics:
+            response_size = len(str(user_dict).encode('utf-8'))
+            metrics.record_request(
+                endpoint=f"/users/{user_id}",
+                response_time_ms=response_time_ms,
+                cache_hit=False,
+                status_code=200,
+                response_size_bytes=response_size
+            )
+        
+        return user_dict
 
 @app.get("/users")
 async def get_all_users(limit: int = 100, offset: int = 0):
     """Get all users with pagination."""
-    # Add artificial delay (30ms)
-    await asyncio.sleep(0.03)
-    
+
     users = db.get_all_users(limit=limit, offset=offset)
     total = db.count_users()
     
@@ -206,17 +401,36 @@ async def get_all_users(limit: int = 100, offset: int = 0):
 
 @app.post("/users")
 async def create_user(user_data: UserCreate):
-    """Create a new user."""
-    # Add artificial delay to simulate database write (20ms)
-    await asyncio.sleep(0.05)
+    """Create a new user with initial ETag."""
+    start_time = time.time()
     
     try:
         user = db.create_user(user_data.name, user_data.email)
     except Exception as e:
-        # Handle duplicate email or other database errors
         raise HTTPException(status_code=400, detail=str(e))
     
-    # TODO: Generate initial ETag and store in cache
+    # Generate initial ETag and store in cache
+    if etag_service and user.id:
+        initial_etag = await etag_service.update_etag(
+            "user", 
+            user.id, 
+            timestamp=user.created_at
+        )
+        print(f"👤 User {user.id} created - Initial ETag: {initial_etag}")
+    
+    # Record metrics
+    if metrics:
+        response_time_ms = (time.time() - start_time) * 1000
+        user_dict = user.to_dict()
+        response_size = len(str(user_dict).encode('utf-8'))
+        
+        metrics.record_request(
+            endpoint="/users",
+            response_time_ms=response_time_ms,
+            cache_hit=False,  # New users are never cache hits
+            status_code=201,
+            response_size_bytes=response_size
+        )
     
     return user.to_dict()
 
@@ -227,8 +441,11 @@ async def update_user(user_id: int, user_data: UserUpdate):
     
     This demonstrates cache invalidation when data changes.
     """
-    # Add artificial delay to simulate database update (30ms)
-    await asyncio.sleep(0.05)
+    start_time = time.time()
+        
+    # Invalidate ETag cache before updating
+    if etag_service:
+        await etag_service.invalidate_etag("user", user_id)
     
     # Update user in database
     user = db.update_user(
@@ -240,22 +457,42 @@ async def update_user(user_id: int, user_data: UserUpdate):
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # TODO: Invalidate ETag cache and generate new ETag
+    # Generate and cache new ETag after update
+    if etag_service:
+        new_etag = await etag_service.update_etag(
+            "user", 
+            user_id, 
+            timestamp=user.updated_at
+        )
+        print(f"🔄 User {user_id} updated - New ETag: {new_etag}")
+    
+    # Record metrics
+    if metrics:
+        response_time_ms = (time.time() - start_time) * 1000
+        user_dict = user.to_dict()
+        response_size = len(str(user_dict).encode('utf-8'))
+        
+        metrics.record_request(
+            endpoint=f"/users/{user_id}",
+            response_time_ms=response_time_ms,
+            cache_hit=False,  # Updates are never cache hits
+            status_code=200,
+            response_size_bytes=response_size
+        )
     
     return user.to_dict()
 
 @app.delete("/users/{user_id}")
 async def delete_user(user_id: int):
-    """Delete a user."""
-    # Add artificial delay (20ms)
-    await asyncio.sleep(0.02)
-    
+    """Delete a user and clean up ETag cache."""
     deleted = db.delete_user(user_id)
     
     if not deleted:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # TODO: Clean up ETag cache
+    if etag_service:
+        await etag_service.invalidate_etag("user", user_id)
+        print(f"🗑️ User {user_id} deleted - ETag cache cleaned")
     
     return {"message": "User deleted successfully", "id": user_id}
 
@@ -266,34 +503,46 @@ async def get_metrics():
     
     Returns cache hit rates, response times, and database query statistics.
     """
-    # TODO: Implement full metrics collection
-    # - Cache hit/miss rates
-    # - Average response times
-    # - Database queries saved
-    # - Bandwidth savings
-    
-    # Basic metrics for now
+    # Get database metrics
     total_users = db.count_users()
+    
+    # Get cache statistics
+    cache_stats = {}
+    if cache_service:
+        cache_stats = await cache_service.get_cache_stats()
+    else:
+        cache_stats = {
+            "connected": False,
+            "status": "Cache service not available"
+        }
+    
+    # Get performance metrics
+    performance_metrics = {}
+    performance_summary = {}
+    if metrics:
+        performance_metrics = metrics.get_metrics()
+        performance_summary = metrics.get_performance_summary()
+    else:
+        performance_metrics = {
+            "performance": {
+                "total_requests": 0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "cache_hit_rate": "0%"
+            }
+        }
+        performance_summary = {
+            "summary": "Metrics collection not available"
+        }
     
     return {
         "database": {
             "total_users": total_users,
             "database_file": db.db_path
         },
-        "cache": {
-            "status": "Not implemented yet",
-            "hit_rate": "0%"
-        },
-        "performance": {
-            "total_requests": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "cache_hit_rate": "0%",
-            "avg_response_time_cached": "0ms",
-            "avg_response_time_uncached": "0ms",
-            "database_queries_saved": 0,
-            "bandwidth_saved_bytes": 0
-        }
+        "cache": cache_stats,
+        "metrics": performance_metrics,
+        "summary": performance_summary
     }
 
 if __name__ == "__main__":
