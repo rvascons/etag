@@ -10,6 +10,7 @@ This module provides:
 
 import redis.asyncio as redis
 import logging
+import os
 from typing import Optional
 import json
 from datetime import timedelta
@@ -285,10 +286,18 @@ async def initialize_cache() -> CacheService:
     """
     Initialize cache service and establish connection.
     
+    Uses environment variables for configuration:
+    - REDIS_HOST: Redis hostname (default: localhost)
+    - REDIS_PORT: Redis port (default: 6379)
+    
     Returns:
         CacheService instance
     """
-    service = CacheService()
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = os.getenv("REDIS_PORT", "6379")
+    redis_url = f"redis://{redis_host}:{redis_port}"
+    
+    service = CacheService(redis_url=redis_url)
     await service.connect()
     return service
 
