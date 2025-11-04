@@ -1,0 +1,37 @@
+{
+  "timestamp": "20251103_224944",
+  "scenarios": [
+    {
+      "name": "Baseline - No ETags",
+      "total_requests": 100,
+      "avg_response_time_ms": 508.7198375003936,
+      "cache_hit_rate": 0.0,
+      "throughput_rps": 1.9643831856675937,
+      "total_bytes": 14000
+    },
+    {
+      "name": "Optimized - With ETags",
+      "total_requests": 100,
+      "avg_response_time_ms": 2.204787970331381,
+      "cache_hit_rate": 100.0,
+      "throughput_rps": 448.021146598498,
+      "total_bytes": 0
+    },
+    {
+      "name": "High Load - No ETags",
+      "total_requests": 500,
+      "avg_response_time_ms": 508.8887047460448,
+      "cache_hit_rate": 0.0,
+      "throughput_rps": 1.9637495170998016,
+      "total_bytes": 70000
+    },
+    {
+      "name": "High Load - With ETags",
+      "total_requests": 500,
+      "avg_response_time_ms": 0.5699575638864189,
+      "cache_hit_rate": 100.0,
+      "throughput_rps": 1735.7376924617947,
+      "total_bytes": 0
+    }
+  ]
+}
